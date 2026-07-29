@@ -24,7 +24,7 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
-
+LOG  = False
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -494,7 +494,8 @@ def save_code_and_config(config: PretrainConfig):
     # Copy code
     code_list = [
         get_model_source_path(config.arch.name),
-        get_model_source_path(config.arch.loss.name)
+        get_model_source_path(config.arch.loss.name),
+        get_model_source_path("arc@ARC",prefix="evaluators."),
     ]
     for code_file in code_list:
         if code_file is not None:
@@ -508,7 +509,8 @@ def save_code_and_config(config: PretrainConfig):
         yaml.dump(config.model_dump(), f)
 
     # Log code
-    wandb.run.log_code(config.checkpoint_path)
+    if LOG:
+     wandb.run.log_code(config.checkpoint_path)
 
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
@@ -580,6 +582,9 @@ def launch(hydra_config: DictConfig):
         evaluators = []
 
     # Train state
+    if LOG:
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+    
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 
     # Progress bar and logger
@@ -587,8 +592,9 @@ def launch(hydra_config: DictConfig):
     ema_helper = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        if LOG:
+          #wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+          wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
     if config.ema:
         print('Setup EMA')
@@ -607,7 +613,8 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                if LOG:
+                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
@@ -633,6 +640,7 @@ def launch(hydra_config: DictConfig):
                 cpu_group=CPU_PROCESS_GROUP)
 
             if RANK == 0 and metrics is not None:
+               if LOG: 
                 wandb.log(metrics, step=train_state.step)
                 
             ############ Checkpointing
@@ -647,7 +655,8 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    if LOG:
+     wandb.finish()
 
 
 if __name__ == "__main__":

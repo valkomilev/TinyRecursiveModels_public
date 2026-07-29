@@ -13,7 +13,7 @@ from dataset.common import PuzzleDatasetMetadata
 @njit
 def _crop(grid: np.ndarray):
     """Find maximum-sized rectangle without any EOS token inside. """
-    grid = grid.reshape(30, 30)
+    grid = grid.reshape(8, 8)
 
     max_area = 0
     max_size = (0, 0)
@@ -89,7 +89,8 @@ class ARC:
         for identifier, input, pred, q in zip(outputs["puzzle_identifiers"].numpy(), outputs["inputs"].numpy(), outputs["preds"].numpy(), q_values.numpy()):
             name = self.identifier_map[identifier]
             orig_name, _inverse_fn = inverse_aug(name)
-            
+            _crop(input)
+            _inverse_fn(_crop(input))
             input_hash = grid_hash(_inverse_fn(_crop(input)))
             
             pred = _inverse_fn(_crop(pred))

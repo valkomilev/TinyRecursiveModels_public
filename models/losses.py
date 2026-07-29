@@ -77,7 +77,15 @@ class ACTLossHead(nn.Module):
                 
                 "accuracy":       torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
-
+                # Extract the scalar float from the parameter
+                
+                "bridge/gate_value": torch.tensor(self.model.inner.bridge.gate.item(),device='cuda:0'),
+                # Optional: track the gradient to see if it's actively learning
+                #"bridge/gate_grad": (
+                #    self.model.inner.bridge.gate.grad.item()
+                #    #if self.model.inner.bridge.gate.grad is not None
+                #    #else 0.0
+                #),
                 "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
                 "steps":          torch.where(valid_metrics, new_carry.steps, 0).sum(),
             }

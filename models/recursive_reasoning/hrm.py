@@ -2,10 +2,11 @@ from typing import Tuple, List, Dict, Optional
 from dataclasses import dataclass
 import math
 import torch
+import wandb
 import torch.nn.functional as F
 from torch import nn
 from pydantic import BaseModel
-
+from torch.distributions import Gamma
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
@@ -25,7 +26,97 @@ class HierarchicalReasoningModel_ACTV1Carry:
     
     current_data: Dict[str, torch.Tensor]
 
+IGNORE_LABEL_ID = -100
+BATCH_SIZE = 80
+HIDDEN_DIM = 8
 
+class IMLESubsetKFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, k, tau, lambda_val, use_gumbel_k=True):
+        device = logits.device
+        shape = logits.shape
+        
+        # 1. Sample Noise (Forward Sample)
+        if use_gumbel_k:
+            # Replicate the Sum-of-Gamma approximation for k-subsets
+            noise = torch.zeros_like(logits)
+            concentration = torch.tensor(1.0 / k, device=device)
+            
+            # Loop matches tf.map_fn over tf.constant([1.0, ..., 10.0])
+            for t in range(1, 11):
+                rate = torch.tensor(k / float(t), device=device)
+                # Sample and add to accumulated noise
+                noise += Gamma(concentration, rate).sample(shape)
+                
+            # the log(m) term offset
+            noise = noise - torch.log(torch.tensor(10.0, device=device))
+            # divide by k
+            noise = tau * (noise / k)
+        else:
+            # Standard Gumbel(0, 1) fallback via inverse transform sampling
+            noise = -torch.empty_like(logits).exponential_().log()
+            
+        # 2. Add noise and compute top-k MAP threshold
+        noisy_logits = logits + noise
+        
+        # Get the k-th largest value along the last dimension to act as the threshold
+        # dim=-1 ensures it works cleanly on your (B, N, D) carry tensors
+        threshold = torch.topk(noisy_logits, k, dim=-1).values[..., -1:]
+        
+        # 3. Create hard mask (1.0 if in top-k, 0.0 otherwise)
+        y_map = (noisy_logits >= threshold).float()
+        
+        # Save tensors for the backward pass
+        ctx.save_for_backward(logits, noise, y_map)
+        # Non-tensor variables must be attached directly to ctx
+        ctx.lambda_val = lambda_val
+        ctx.k = k
+        
+        return y_map
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Retrieve saved tensors and variables
+        logits, noise, y_map = ctx.saved_tensors
+        lambda_val = ctx.lambda_val
+        k = ctx.k
+        
+        # 1. Perturb the logits using the incoming gradient (dy)
+        target_logits = logits - (lambda_val * grad_output) + noise
+        
+        # 2. MAP on the target distribution (find new threshold)
+        threshold = torch.topk(target_logits, k, dim=-1).values[..., -1:]
+        map_y = (target_logits >= threshold).float()
+        
+        # 3. Compute the gradient of the conditional log-likelihood (IMLE formula)
+        grad_logits = (1.0 / lambda_val) * (y_map - map_y)
+        
+        # Must return exactly one gradient for every input to forward()
+        # Since k, tau, lambda_val, and use_gumbel_k are scalars/booleans, they get None
+        return grad_logits, None, None, None, None
+
+
+class IMLESubsetKLayer(nn.Module):
+    def __init__(self, k=8, tau=10.0, lambda_val=10.0, use_gumbel_k=True):
+        super(IMLESubsetKLayer, self).__init__()
+        self.k = k
+        self.tau = tau
+        self.lambda_val = lambda_val
+        self.use_gumbel_k = use_gumbel_k
+        
+    def forward(self, logits):
+        """
+        Expects `logits` tensor of shape (B, N, D) or similar.
+        The top-k operation is automatically applied across the last dimension (dim=-1).
+        """
+        # Apply the custom autograd function
+        return IMLESubsetKFunction.apply(
+            logits, 
+            self.k, 
+            self.tau, 
+            self.lambda_val, 
+            self.use_gumbel_k
+        )
 class HierarchicalReasoningModel_ACTV1Config(BaseModel):
     batch_size: int
     seq_len: int
@@ -56,7 +147,236 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
 
     # Alexia: added
     mlp_t: bool=False # use mlp on L instead of transformer
+def my_symbolic_rule(pixel_grid_tensor):
+    # This receives raw integer tensors of shape (B, N)
+    grid = pixel_grid_tensor.clone()
+                       
+    # Determine the number of rows
+    num_rows = grid.shape[0]
+    for i in range(num_rows):
+        # Extract the row as a 1D tensor without converting to a Python list
+        row = grid[i] 
+                        
+        # Use PyTorch native operations to find what numbers are present
+        # We convert it to a standard python set for lightning-fast 'in' checks
+        # without triggering PyTorch computation graphs
+        numbers_present = set(row.tolist()) 
+                        
+        counter = 0
+        for j in range(10):
+            counter += 1
+            if j in numbers_present:
+                continue
+            if counter >= 10:
+                break
+             # In-place modification of the tensor
+            grid[i][counter] = j
+                           
+    return grid
+class SymbolicReadWriteBridge(nn.Module):
 
+    def __init__(self, hidden_dim: int, vocab_size: int = 10):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.vocab_size = vocab_size
+        self.imle = IMLESubsetKLayer()
+
+        # 1. READ HEAD: Projects D-dimensional vector to discrete pixel logits
+        self.read_head = nn.Linear(hidden_dim, vocab_size)
+
+        # 3. WRITE HEAD: Maps discrete symbolic results back to D-dimensional vectors
+        self.write_head = nn.Embedding(vocab_size, hidden_dim)
+
+        # Optional: A learned gate to let the network decide how strongly
+        # to apply the symbolic result (0.0 = ignore symbol, 1.0 = full inject)
+        self.gate = nn.Parameter(torch.tensor([0.1]))
+       
+
+    def forward(self, carry: torch.Tensor, symbolic_func):
+        """carry shape: (B, N, D)
+
+        symbolic_func: A function taking a discrete tensor of shape (B, N)
+        and returning a modified discrete tensor of shape (B, N).
+        """
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            B, N, D = carry.shape
+
+            # --- STEP 1: READ ---
+            # Get logits over the pixel vocabulary (e.g., 10 ARC colors)
+            logits = self.read_head(carry)  # Shape: (B, N, vocab_size)
+
+            # Soft probabilities for the backward pass
+            soft_probs = F.softmax(logits, dim=-1)
+
+            # Hard discrete tokens for the symbolic engine (forward pass)
+            hard_tokens = torch.argmax(soft_probs, dim=-1)  # Shape: (B, N)
+
+            # --- STEP 2: SYMBOLIC EXECUTION ---
+            # Execute your non-differentiable Python/C++ rule engine on discrete integers
+            with torch.no_grad():
+                modified_tokens = symbolic_func(hard_tokens)  # Shape: (B, N)
+                # Ensure output is clamped to valid vocab indices
+                modified_tokens = torch.clamp(
+                    modified_tokens, 0, self.vocab_size - 1
+                )
+
+            # --- STEP 3: WRITE & STRAIGHT-THROUGH ESTIMATION (STE) ---
+            # Look up the D-dimensional embeddings for the new symbolic tokens
+            target_embeddings = self.write_head(
+                modified_tokens
+            )  # Shape: (B, N, D)
+
+            # STE Trick: We want the forward pass to use the exact `target_embeddings`,
+            # but we want gradients to flow back into `read_head` via `soft_probs`.
+            # We project soft_probs through the write_head's weight matrix differentiable-ly:
+            soft_embeddings = torch.matmul(soft_probs, self.write_head.weight)
+
+            # Combine hard forward + soft backward
+            symbolic_vector = (
+                target_embeddings - soft_embeddings.detach()
+            ) + soft_embeddings
+            #IMLE estimation
+            symbolic_vector = self.imle(symbolic_vector)
+
+            # --- STEP 4: RESIDUAL INJECTION ---
+            # Add the symbolic vector back into the carry tensor without overwriting relational memory
+            updated_carry = carry + (self.gate * symbolic_vector)
+
+            return updated_carry
+        
+class Circuit(nn.Module): 
+        def __init__(self):
+            super().__init__()
+            # self.input_weight_1 = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+            # self.input_weight_2 = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+            # self.input_weight_3 = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+            self.softmax_1 = torch.nn.Softmax()
+            self.softmax_2 = torch.nn.Softmax()
+            self.softmax_3 = torch.nn.Softmax()
+            #self.noise_scheduler = ScheduledLatentNoise(warmup_steps=15000)
+            self.mode = 1
+            self.enable_noise = False
+            if self.mode == 0:
+                self.multi_func = torch.nn.MultiheadAttention(embed_dim=5120,num_heads=8,batch_first=True)
+            elif self.mode == 1:
+                self.input_weight_1 = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+                self.input_weight_2 = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+                self.input_weight_3 = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+                self.input_weight_null = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
+            elif self.mode == 2:
+                self.cat_all = torch.nn.Linear(64*BATCH_SIZE*2,64*BATCH_SIZE)
+
+        def soduko_solver_v1(self, memory_vb_symbolic):
+                    
+                        
+                    # Determine the number of rows
+                    num_rows = memory_vb_symbolic.shape[0]
+                    for i in range(num_rows):
+                        # Extract the row as a 1D tensor without converting to a Python list
+                        row = memory_vb_symbolic[i] 
+                        
+                        # Use PyTorch native operations to find what numbers are present
+                        # We convert it to a standard python set for lightning-fast 'in' checks
+                        # without triggering PyTorch computation graphs
+                        numbers_present = set(row.tolist()) 
+                        
+                        counter = 0
+                        for j in range(10):
+                            counter += 1
+                            if j in numbers_present:
+                                continue
+                            if counter >= 10:
+                                break
+                            
+                            # In-place modification of the tensor
+                            memory_vb_symbolic[i][counter] = j
+                            
+                    return memory_vb_symbolic
+        def soduko_solver_v1_no_loop(self, memory_vb_symbolic):
+            
+        
+                # Extract the row as a 1D tensor without converting to a Python list
+                row = memory_vb_symbolic[1] 
+                
+                # Use PyTorch native operations to find what numbers are present
+                # We convert it to a standard python set for lightning-fast 'in' checks
+                # without triggering PyTorch computation graphs
+                numbers_present = row.tolist() 
+                
+                counter = 0
+                for j in range(10):
+                    counter += 1
+                    if j in numbers_present:
+                        continue
+                    if counter >= 10:
+                        break
+                    
+                    # In-place modification of the tensor
+                    memory_vb_symbolic[1][counter] = j
+                    
+                return memory_vb_symbolic
+        def аddd(self, memory_vb_symbolic):
+                # Extract the row as a 1D tensor without converting to a Python list
+                memory_vb_symbolic[2] +=1
+                return memory_vb_symbolic
+        def sub(self, memory_vb_symbolic):
+                # Extract the row as a 1D tensor without converting to a Python list
+                memory_vb_symbolic[3] -=1
+                return memory_vb_symbolic
+        def forward(self, input_vb):
+         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            shape_1 = input_vb.shape[0]
+            shape_2 = input_vb.shape[1]
+            puzzle_embs = input_vb
+       
+            if self.mode == 0:
+                input_vb_reshaped = torch.reshape(torch.clone(puzzle_embs), ( -1,BATCH_SIZE* 64))
+
+                solver_result_1 = self.soduko_solver_v1(input_vb_reshaped)
+                #solver_result_2 = self.аddd(input_vb_reshaped)
+                #solver_result_3 = self.sub(input_vb_reshaped)
+                #if self.enable_noise:
+                    #solver_result_1 = self.noise_scheduler(solver_result_1)
+                    #solver_result_2 = self.noise_scheduler(solver_result_2)
+                    #solver_result_3 = self.noise_scheduler(solver_result_3)
+                M_tensor = torch.stack([solver_result_1], dim=1)#solver_result_2,solver_result_3
+                query = input_vb_reshaped.unsqueeze(1)
+                attn_output, attn_output_weights = self.multi_func(query, M_tensor,M_tensor)
+                attn_output = attn_output.squeeze(1)
+                attn_output = attn_output.reshape(shape_1,shape_2, -1)
+                return attn_output
+            elif self.mode == 1:
+                input_vb_reshaped = torch.reshape(torch.clone(puzzle_embs), ( -1,BATCH_SIZE* 64))
+                solver_result_1 = self.soduko_solver_v1(input_vb_reshaped)
+                solver_result_null = torch.zeros_like(input_vb_reshaped,device="cuda:0")
+                #solver_result_2 = self.аddd(input_vb_reshaped)
+                #solver_result_3 = self.sub(input_vb_reshaped)
+                input_mask_1 = self.softmax_1(self.input_weight_1(input_vb_reshaped))
+                input_mask_null = self.softmax_1(self.input_weight_null(input_vb_reshaped))
+                #input_mask_2 = self.softmax_2(self.input_weight_2(input_vb_reshaped))
+                #input_mask_3 = self.softmax_3(self.input_weight_3(input_vb_reshaped))
+                candidates = torch.stack([solver_result_1, solver_result_null])
+                #FIX THE SLOWNESS
+                logits =torch.stack([input_mask_1, input_mask_null], dim=0)
+                weights = torch.softmax(logits, dim=0)
+
+                #combined_results =  solver_result_1*input_mask_1 +input_vb_reshaped + #+solver_result_2*input_mask_2+solver_result_3*input_mask_3
+                #final_tensor = (weights * candidates).sum(dim=0)
+                #print("candidates",candidates.shape)
+                #print("weights",weights.shape)
+                final_tensor = torch.bmm(weights.mT, candidates).sum(dim=0) #(weights * candidates).sum(0)
+                print("final_tensor",final_tensor.shape)
+                print("puzzle_embs",puzzle_embs.shape)
+                attn_output = final_tensor.reshape(shape_1,shape_2, -1).sum(0)
+                return attn_output
+            elif self.mode == 2:
+                input_vb_reshaped = torch.reshape(torch.clone(puzzle_embs), ( -1,BATCH_SIZE* 64))
+                solver_result_1 = self.soduko_solver_v1(input_vb_reshaped)
+                #solver_result_2 = self.аddd(input_vb_reshaped)
+                #solver_result_3 = self.sub(input_vb_reshaped)
+                combined_results =  self.cat_all(torch.cat([input_vb_reshaped,solver_result_1], dim=-1))#,solver_result_2,solver_result_3
+                attn_output = combined_results.reshape(shape_1,shape_2, -1)
+                return attn_output
 class HierarchicalReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
         super().__init__()
@@ -119,11 +439,13 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
-
+        self.circuit = Circuit()
+        self.bridge = SymbolicReadWriteBridge(hidden_dim=HIDDEN_DIM, vocab_size=10)
+        #wandb.watch(self.bridge, log="all", log_freq=100)
         # I/O
         self.embed_scale  = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
-
+        self.step = 0
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
@@ -198,20 +520,42 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         )
 
         # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        #print('shape1',batch["inputs"].shape)
+        #print('shape2',batch["labels"].shape)
 
+        input_embeddings = self._input_embeddings(batch["inputs"].clone(), batch["puzzle_identifiers"].clone())
+        safe_labels = batch["labels"].clone()
+        safe_labels = torch.where(safe_labels < 0, torch.zeros_like(safe_labels), safe_labels)
+        safe_labels = torch.where(safe_labels >= 12, torch.zeros_like(safe_labels), safe_labels)
+        labels_embeddings = self._input_embeddings(safe_labels, batch["puzzle_identifiers"].clone())
+        #print('shape3',input_embeddings.shape)
+        #print('shape4',labels_embeddings.shape)
         # Forward iterations
+        #if self.step % 10 == 0:
+        #    wandb.log({"bridge/gate_value": self.bridge.gate.item()}, step=self.step)
+        #self.step +=1
         with torch.no_grad():
             z_H, z_L = carry.z_H, carry.z_L
             for _H_step in range(self.config.H_cycles):
                 for _L_step in range(self.config.L_cycles):
                     if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                        z_L = self.L_level(z_L, z_H, **seq_info)
+                
                 if not (_H_step == self.config.H_cycles - 1):
+                    #print("z_H",z_H.shape)
+                    #print("labels_embeddings",labels_embeddings.shape)
+                    #z_H = torch.add(z_H,torch.mul(labels_embeddings,0.1))
+                    #z_H = self.circuit(z_H)
+                    z_H = self.bridge(z_H, my_symbolic_rule)
                     z_H = self.H_level(z_H, z_L, **seq_info)
         assert not z_H.requires_grad and not z_L.requires_grad
         # 1-step grad
         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+        #print("z_H",z_H.shape)
+        #print("labels_embeddings",labels_embeddings.shape)
+        #z_H = torch.add(z_H,torch.mul(labels_embeddings,0.1))
+        #z_H = self.circuit(z_H)
+        z_H = self.bridge(z_H, my_symbolic_rule)
         z_H = self.H_level(z_H, z_L, **seq_info)
 
         # LM Outputs
