@@ -89,16 +89,17 @@ class ARC:
         for identifier, input, pred, q in zip(outputs["puzzle_identifiers"].numpy(), outputs["inputs"].numpy(), outputs["preds"].numpy(), q_values.numpy()):
             name = self.identifier_map[identifier]
             orig_name, _inverse_fn = inverse_aug(name)
+
             _crop(input)
-            _inverse_fn(_crop(input))
-            input_hash = grid_hash(_inverse_fn(_crop(input)))
+            _crop(input)
+            input_hash = grid_hash(_crop(input))
             
-            pred = _inverse_fn(_crop(pred))
+            pred = _crop(pred)
             assert np.all((pred >= 0) & (pred <= 9)), f"Puzzle {name}'s prediction out of 0-9 range."  # Sanity check
 
             # Store into local state
             pred_hash = grid_hash(pred)
-
+            print("_local_preds",list(self._local_preds.keys()))
             self._local_hmap[pred_hash] = pred
             
             self._local_preds.setdefault(orig_name, {})

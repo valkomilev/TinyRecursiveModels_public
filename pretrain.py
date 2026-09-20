@@ -24,7 +24,7 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
-LOG  = False
+LOG  = True
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -293,7 +293,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
-
     # Init carry if it is None
     if train_state.carry is None:
         with torch.device("cuda"):
@@ -539,7 +538,7 @@ def launch(hydra_config: DictConfig):
     RANK = 0
     WORLD_SIZE = 1
     CPU_PROCESS_GROUP = None
-
+    
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
         # Initialize distributed, default device and dtype
@@ -557,6 +556,7 @@ def launch(hydra_config: DictConfig):
         )
 
     # Load sync'ed config
+    print("hydra_config",hydra_config)
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
     # Seed RNGs to ensure consistency

@@ -24,7 +24,7 @@ class DataProcessConfig(BaseModel):
     num_aug: int = 1000
     puzzle_identifiers_start: int = 1 # start > 1 to handle multiple datasets
     
-ARCMaxGridSize = 30
+ARCMaxGridSize = 8
 ARCAugmentRetriesFactor = 5
 
 PuzzleIdSeparator = "|||"
@@ -142,7 +142,7 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
             aug_name, _map_grid = aug(name)
 
             # Check duplicate
-            augmented = {dest: ARCPuzzle(aug_name, [(_map_grid(input), _map_grid(label)) for (input, label) in puzzle.examples]) for dest, puzzle in converted.items()}
+            augmented = {dest: ARCPuzzle(name, [(input, label) for (input, label) in puzzle.examples]) for dest, puzzle in converted.items()}
             h = puzzle_hash(augmented)
             if h not in hashes:
                 hashes.add(h)

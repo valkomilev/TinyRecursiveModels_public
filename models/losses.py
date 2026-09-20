@@ -80,6 +80,11 @@ class ACTLossHead(nn.Module):
                 # Extract the scalar float from the parameter
                 
                 "bridge/gate_value": torch.tensor(self.model.inner.bridge.gate.item(),device='cuda:0'),
+                "bridge/read_grad": (
+    self.model.inner.bridge.read_head.weight.grad.norm().detach()
+    if self.model.inner.bridge.read_head.weight.grad is not None
+    else torch.tensor(0.0, device="cuda:0")
+),
                 # Optional: track the gradient to see if it's actively learning
                 #"bridge/gate_grad": (
                 #    self.model.inner.bridge.gate.grad.item()

@@ -147,39 +147,46 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
 
     # Alexia: added
     mlp_t: bool=False # use mlp on L instead of transformer
-def my_symbolic_rule(pixel_grid_tensor):
-    # This receives raw integer tensors of shape (B, N)
-    grid = pixel_grid_tensor.clone()
+# def my_symbolic_rule(pixel_grid_tensor):
+#     # This receives raw integer tensors of shape (B, N)
+#     grid = pixel_grid_tensor.clone()
                        
-    # Determine the number of rows
-    num_rows = grid.shape[0]
-    for i in range(num_rows):
-        # Extract the row as a 1D tensor without converting to a Python list
-        row = grid[i] 
+#     # Determine the number of rows
+#     num_rows = grid.shape[0]
+#     for i in range(num_rows):
+#         # Extract the row as a 1D tensor without converting to a Python list
+#         row = grid[i] 
                         
-        # Use PyTorch native operations to find what numbers are present
-        # We convert it to a standard python set for lightning-fast 'in' checks
-        # without triggering PyTorch computation graphs
-        numbers_present = set(row.tolist()) 
+#         # Use PyTorch native operations to find what numbers are present
+#         # We convert it to a standard python set for lightning-fast 'in' checks
+#         # without triggering PyTorch computation graphs
+#         numbers_present = set(row.tolist()) 
                         
-        counter = 0
-        for j in range(10):
-            counter += 1
-            if j in numbers_present:
-                continue
-            if counter >= 10:
-                break
-             # In-place modification of the tensor
-            grid[i][counter] = j
+#         counter = 0
+#         for j in range(10):
+#             counter += 1
+#             if j in numbers_present:
+#                 continue
+#             if counter >= 10:
+#                 break
+#              # In-place modification of the tensor
+#             grid[i][counter] = j
                            
-    return grid
+#     return grid
+
+def my_symbolic_rule(pixel_grid_tensor):
+    local_grid = pixel_grid_tensor.clone()
+    local_grid = (local_grid**2)/5
+    local_grid = torch.clamp(local_grid, min=0.0, max=9.0)
+    return local_grid.round().long()
 class SymbolicReadWriteBridge(nn.Module):
 
-    def __init__(self, hidden_dim: int, vocab_size: int = 10):
+    def __init__(self, hidden_dim: int, vocab_size: int = 10,symbolic_func=None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
-        self.imle = IMLESubsetKLayer()
+        self.imle = IMLESubsetKLayer(tau=1.0)
+        self.batched_func = torch.vmap(symbolic_func)
 
         # 1. READ HEAD: Projects D-dimensional vector to discrete pixel logits
         self.read_head = nn.Linear(hidden_dim, vocab_size)
@@ -192,7 +199,7 @@ class SymbolicReadWriteBridge(nn.Module):
         self.gate = nn.Parameter(torch.tensor([0.1]))
        
 
-    def forward(self, carry: torch.Tensor, symbolic_func):
+    def forward(self, carry: torch.Tensor,symbolic_func):
         """carry shape: (B, N, D)
 
         symbolic_func: A function taking a discrete tensor of shape (B, N)
@@ -204,17 +211,17 @@ class SymbolicReadWriteBridge(nn.Module):
             # --- STEP 1: READ ---
             # Get logits over the pixel vocabulary (e.g., 10 ARC colors)
             logits = self.read_head(carry)  # Shape: (B, N, vocab_size)
-
+            y_max = self.imle(logits)
             # Soft probabilities for the backward pass
-            soft_probs = F.softmax(logits, dim=-1)
+            #soft_probs = F.softmax(logits, dim=-1)
 
             # Hard discrete tokens for the symbolic engine (forward pass)
-            hard_tokens = torch.argmax(soft_probs, dim=-1)  # Shape: (B, N)
+            hard_tokens = torch.argmax(y_max, dim=-1)  # Shape: (B, N)
 
             # --- STEP 2: SYMBOLIC EXECUTION ---
             # Execute your non-differentiable Python/C++ rule engine on discrete integers
             with torch.no_grad():
-                modified_tokens = symbolic_func(hard_tokens)  # Shape: (B, N)
+                modified_tokens = self.batched_func(hard_tokens)  # Shape: (B, N)
                 # Ensure output is clamped to valid vocab indices
                 modified_tokens = torch.clamp(
                     modified_tokens, 0, self.vocab_size - 1
@@ -229,14 +236,14 @@ class SymbolicReadWriteBridge(nn.Module):
             # STE Trick: We want the forward pass to use the exact `target_embeddings`,
             # but we want gradients to flow back into `read_head` via `soft_probs`.
             # We project soft_probs through the write_head's weight matrix differentiable-ly:
-            soft_embeddings = torch.matmul(soft_probs, self.write_head.weight)
+            soft_embeddings = torch.matmul(y_max, self.write_head.weight)
 
-            # Combine hard forward + soft backward
+            # # Combine hard forward + soft backward
             symbolic_vector = (
-                target_embeddings - soft_embeddings.detach()
+                 target_embeddings - soft_embeddings.detach()
             ) + soft_embeddings
             #IMLE estimation
-            symbolic_vector = self.imle(symbolic_vector)
+            #my experimental location 
 
             # --- STEP 4: RESIDUAL INJECTION ---
             # Add the symbolic vector back into the carry tensor without overwriting relational memory
@@ -365,8 +372,7 @@ class Circuit(nn.Module):
                 #print("candidates",candidates.shape)
                 #print("weights",weights.shape)
                 final_tensor = torch.bmm(weights.mT, candidates).sum(dim=0) #(weights * candidates).sum(0)
-                print("final_tensor",final_tensor.shape)
-                print("puzzle_embs",puzzle_embs.shape)
+
                 attn_output = final_tensor.reshape(shape_1,shape_2, -1).sum(0)
                 return attn_output
             elif self.mode == 2:
@@ -440,8 +446,8 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.circuit = Circuit()
-        self.bridge = SymbolicReadWriteBridge(hidden_dim=HIDDEN_DIM, vocab_size=10)
-        #wandb.watch(self.bridge, log="all", log_freq=100)
+        self.bridge = SymbolicReadWriteBridge(hidden_dim=HIDDEN_DIM, vocab_size=10,symbolic_func=my_symbolic_rule)
+        wandb.watch(self.bridge, log="all", log_freq=100)
         # I/O
         self.embed_scale  = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -489,6 +495,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
+
             if pad_count > 0:
                 puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
 
@@ -555,7 +562,7 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         #print("labels_embeddings",labels_embeddings.shape)
         #z_H = torch.add(z_H,torch.mul(labels_embeddings,0.1))
         #z_H = self.circuit(z_H)
-        z_H = self.bridge(z_H, my_symbolic_rule)
+        z_H =self.bridge(z_H, my_symbolic_rule)
         z_H = self.H_level(z_H, z_L, **seq_info)
 
         # LM Outputs
