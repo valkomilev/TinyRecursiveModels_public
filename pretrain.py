@@ -583,7 +583,7 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     if LOG:
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+        wandb.init(project=config.project_name, name=config.run_name,tags = ["removed_aug","softmax","multy_functions"], config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
     
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
 

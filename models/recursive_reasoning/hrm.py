@@ -174,9 +174,15 @@ class HierarchicalReasoningModel_ACTV1Config(BaseModel):
                            
 #     return grid
 
-def my_symbolic_rule(pixel_grid_tensor):
+def my_symbolic_rule_1(pixel_grid_tensor):
     local_grid = pixel_grid_tensor.clone()
-    local_grid = (local_grid**2)/5
+    local_grid = (local_grid**2)
+    local_grid = torch.clamp(local_grid, min=0.0, max=9.0)
+    return local_grid.round().long()
+
+def my_symbolic_rule_2(pixel_grid_tensor):
+    local_grid = pixel_grid_tensor.clone()
+    local_grid = (local_grid)/5
     local_grid = torch.clamp(local_grid, min=0.0, max=9.0)
     return local_grid.round().long()
 class SymbolicReadWriteBridge(nn.Module):
@@ -197,9 +203,10 @@ class SymbolicReadWriteBridge(nn.Module):
         # Optional: A learned gate to let the network decide how strongly
         # to apply the symbolic result (0.0 = ignore symbol, 1.0 = full inject)
         self.gate = nn.Parameter(torch.tensor([0.1]))
-       
+        self.gate_softmax = nn.Softmax()
+        self.input_weight_softmax = torch.nn.Linear(64*BATCH_SIZE,64*BATCH_SIZE)
 
-    def forward(self, carry: torch.Tensor,symbolic_func):
+    def forward(self, carry: torch.Tensor,symbolic_func):   
         """carry shape: (B, N, D)
 
         symbolic_func: A function taking a discrete tensor of shape (B, N)
@@ -210,6 +217,7 @@ class SymbolicReadWriteBridge(nn.Module):
 
             # --- STEP 1: READ ---
             # Get logits over the pixel vocabulary (e.g., 10 ARC colors)
+            self.gate_weight = self.gate_softmax(self.input_weight_softmax(carry))
             logits = self.read_head(carry)  # Shape: (B, N, vocab_size)
             y_max = self.imle(logits)
             # Soft probabilities for the backward pass
@@ -247,6 +255,7 @@ class SymbolicReadWriteBridge(nn.Module):
 
             # --- STEP 4: RESIDUAL INJECTION ---
             # Add the symbolic vector back into the carry tensor without overwriting relational memory
+            
             updated_carry = carry + (self.gate * symbolic_vector)
 
             return updated_carry
@@ -446,8 +455,10 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
         self.circuit = Circuit()
-        self.bridge = SymbolicReadWriteBridge(hidden_dim=HIDDEN_DIM, vocab_size=10,symbolic_func=my_symbolic_rule)
-        wandb.watch(self.bridge, log="all", log_freq=100)
+        self.bridge_1 = SymbolicReadWriteBridge(hidden_dim=HIDDEN_DIM, vocab_size=10,symbolic_func=my_symbolic_rule_1)
+        self.bridge_2 = SymbolicReadWriteBridge(hidden_dim=HIDDEN_DIM, vocab_size=10,symbolic_func=my_symbolic_rule_2)
+        wandb.watch(self.bridge_1, log="all", log_freq=100)
+        wandb.watch(self.bridge_2, log="all", log_freq=100)
         # I/O
         self.embed_scale  = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
@@ -553,7 +564,8 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
                     #print("labels_embeddings",labels_embeddings.shape)
                     #z_H = torch.add(z_H,torch.mul(labels_embeddings,0.1))
                     #z_H = self.circuit(z_H)
-                    z_H = self.bridge(z_H, my_symbolic_rule)
+                    #z_H = self.bridge_1(z_H, my_symbolic_rule_1)
+                    #z_H = self.bridge_2(z_H, my_symbolic_rule_2)
                     z_H = self.H_level(z_H, z_L, **seq_info)
         assert not z_H.requires_grad and not z_L.requires_grad
         # 1-step grad
@@ -562,7 +574,8 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
         #print("labels_embeddings",labels_embeddings.shape)
         #z_H = torch.add(z_H,torch.mul(labels_embeddings,0.1))
         #z_H = self.circuit(z_H)
-        z_H =self.bridge(z_H, my_symbolic_rule)
+        #z_H = self.bridge_1(z_H, my_symbolic_rule_1)
+        #z_H = self.bridge_2(z_H, my_symbolic_rule_2)
         z_H = self.H_level(z_H, z_L, **seq_info)
 
         # LM Outputs
